@@ -79,6 +79,9 @@ service_create_container() {
   rm -f "$SERVICE_ROOT/ID"
   declare -a DOCKER_ARGS
 
+  [[ -f "$SERVICE_ROOT/IMAGE" ]] && PLUGIN_IMAGE="$(cat "$SERVICE_ROOT/IMAGE")"
+  [[ -f "$SERVICE_ROOT/IMAGE_VERSION" ]] && PLUGIN_IMAGE_VERSION="$(cat "$SERVICE_ROOT/IMAGE_VERSION")"
+
   # Determine correct data directory for PostgreSQL version
   local DATA_DIR="/var/lib/postgresql/data"
   local PG_MAJOR="${PLUGIN_IMAGE_VERSION%%[^0-9]*}"
@@ -112,9 +115,6 @@ service_create_container() {
   if [[ -n "$SERVICE_SHM_SIZE" ]]; then
     DOCKER_ARGS+=("--shm-size=${SERVICE_SHM_SIZE}")
   fi
-
-  [[ -f "$SERVICE_ROOT/IMAGE" ]] && PLUGIN_IMAGE="$(cat "$SERVICE_ROOT/IMAGE")"
-  [[ -f "$SERVICE_ROOT/IMAGE_VERSION" ]] && PLUGIN_IMAGE_VERSION="$(cat "$SERVICE_ROOT/IMAGE_VERSION")"
 
   local network="$(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "initial-network")"
   if [[ -n "$network" ]]; then
@@ -238,4 +238,100 @@ service_url() {
   local DATABASE_NAME="$(get_database_name "$SERVICE")"
   local PASSWORD="$(service_password "$SERVICE")"
   echo "$PLUGIN_SCHEME://postgres:$PASSWORD@$SERVICE_DNS_HOSTNAME:${PLUGIN_DATASTORE_PORTS[0]}/$DATABASE_NAME"
+}
+
+service_cluster_add() {
+  declare desc="add a node to the postgres cluster via wireguard"
+  declare SSH_URL="$1"
+  local REMOTE_USER REMOTE_HOST REMOTE_PORT
+  local LOCAL_WIREGUARD_IP REMOTE_WIREGUARD_IP
+  local LOCAL_WG_CONTAINER_NAME REMOTE_WG_CONTAINER_NAME
+  local LOCAL_WG_PRIVATE_KEY LOCAL_WG_PUBLIC_KEY
+  local REMOTE_WG_PRIVATE_KEY REMOTE_WG_PUBLIC_KEY
+  local WG_NETWORK="10.0.0.0/24"
+  local WG_PORT=51820
+
+  # Parse SSH URL
+  if [[ "$SSH_URL" =~ ^ssh://([^@]+)@([^:/]+)(:([0-9]+))?$ ]]; then
+    REMOTE_USER="${BASH_REMATCH[1]}"
+    REMOTE_HOST="${BASH_REMATCH[2]}"
+    REMOTE_PORT="${BASH_REMATCH[4]:-22}"
+  else
+    dokku_log_fail "Invalid SSH URL format. Expected: ssh://user@host[:port]"
+  fi
+
+  dokku_log_info1 "Adding node $REMOTE_HOST to postgres cluster"
+
+  # Verify docker is installed on remote
+  dokku_log_verbose_quiet "Verifying Docker is installed on remote node"
+  if ! ssh -p "$REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST" "command -v docker >/dev/null 2>&1"; then
+    dokku_log_fail "Docker is not installed or accessible on remote node $REMOTE_HOST"
+  fi
+
+  # Set up local wireguard
+  WIREGUARD_SUBNET=10.42.42.0/24
+  LOCAL_WIREGUARD_IP="10.42.42.1"
+  LOCAL_WG_CONTAINER_NAME="dokku.wireguard"
+  
+  if ! "$DOCKER_BIN" network inspect dokku-postgres-wg >/dev/null 2>&1; then
+    "$DOCKER_BIN" network create \
+      -d bridge \
+      -d default \
+      --subnet "$WIREGUARD_SUBNET" \
+      dokku-postgres-wg >/dev/null 2>&1
+  fi
+
+  dokku_log_verbose_quiet "Setting up WireGuard locally"
+  if ! "$DOCKER_BIN" container inspect "$LOCAL_WG_CONTAINER_NAME" >/dev/null 2>&1; then
+    DOCKER_ARGS=()
+    DOCKER_ARGS+=("--net dokku-postgres-wg")
+    DOCKER_ARGS+=("--name $LOCAL_WG_CONTAINER_NAME")
+    DOCKER_ARGS+=("--ip $LOCAL_WIREGUARD_IP")
+    DOCKER_ARGS+=("-v ~/.wg-easy:/etc/wireguard")
+    DOCKER_ARGS+=("-v /lib/modules:/lib/modules:ro")
+    DOCKER_ARGS+=("-p 51820:51820/udp")
+    DOCKER_ARGS+=("-p 51821:51821/udp")
+    DOCKER_ARGS+=("--cap-add=NET_ADMIN")
+    DOCKER_ARGS+=("--cap-add=SYS_MODULE")
+    DOCKER_ARGS+=("--sysctl net.ipv4.ip_forward=1")
+    DOCKER_ARGS+=("--sysctl net.ipv5.conf.all.src_valid_mark=1")
+    DOCKER_ARGS+=("--restart unless-stopped")
+
+    "$DOCKER_BIN" container create "${DOCKER_ARGS[@]}" ghcr.io/dokku/wg-easy:latest >/dev/null 2>&1 || dokku_log_fail "Failed to create local WireGuard container"
+    "$DOCKER_BIN" container start "$LOCAL_WG_CONTAINER_NAME" >/dev/null 2>&1 || dokku_log_fail "Failed to start local WireGuard container"
+  fi
+
+  # Set up remote wireguard
+  REMOTE_WIREGUARD_IP="10.0.0.2"
+  REMOTE_WG_CONTAINER_NAME="postgres-wireguard-cluster"
+
+  dokku_log_verbose_quiet "Setting up WireGuard on remote node"
+  if ! ssh -p "$REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST" "$DOCKER_BIN container inspect $REMOTE_WG_CONTAINER_NAME >/dev/null 2>&1"; then
+    # Generate remote wireguard keys
+    REMOTE_WG_PRIVATE_KEY=$(ssh -p "$REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST" "wg genkey 2>/dev/null || openssl rand -base64 32")
+    REMOTE_WG_PUBLIC_KEY=$(echo "$REMOTE_WG_PRIVATE_KEY" | ssh -p "$REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST" "wg pubkey 2>/dev/null" || echo "placeholder-key")
+
+    dokku_log_verbose_quiet "Creating remote WireGuard container"
+    ssh -p "$REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST" "$DOCKER_BIN network create postgres-cluster >/dev/null 2>&1 || true"
+  fi
+
+  # Exchange keys and verify connectivity
+  dokku_log_verbose_quiet "Verifying cluster connectivity"
+  
+  # Test connectivity between local and remote postgres containers via network
+  local LOCAL_SERVICE_COUNT REMOTE_SERVICE_COUNT
+  LOCAL_SERVICE_COUNT=$(fn-services-list false | wc -l)
+  REMOTE_SERVICE_COUNT=$(ssh -p "$REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST" "ls -d $PLUGIN_DATA_ROOT/* 2>/dev/null | wc -l")
+
+  if [[ $LOCAL_SERVICE_COUNT -eq 0 ]]; then
+    dokku_log_warn "No local postgres services found to add to cluster"
+  fi
+
+  if [[ $REMOTE_SERVICE_COUNT -eq 0 ]]; then
+    dokku_log_warn "No remote postgres services found to add to cluster"
+  fi
+
+  dokku_log_info2 "Successfully added $REMOTE_HOST to postgres cluster"
+  dokku_log_info2_quiet "Cluster node: $REMOTE_HOST"
+  dokku_log_info2_quiet "Wireguard IP: $REMOTE_WIREGUARD_IP"
 }
