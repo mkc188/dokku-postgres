@@ -645,13 +645,6 @@ service_link() {
   plugn trigger service-action pre-link "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
   add_to_links_file "$SERVICE" "$APP"
 
-  if declare -f -F add_passed_docker_option >/dev/null; then
-    # shellcheck disable=SC2034
-    local passed_phases=(build deploy run)
-    add_passed_docker_option passed_phases[@] "--link $SERVICE_NAME:$SERVICE_DNS_HOSTNAME"
-  else
-    dokku docker-options:add "$APP" build,deploy,run "--link $SERVICE_NAME:$SERVICE_DNS_HOSTNAME"
-  fi
   [[ -n "$SERVICE_QUERYSTRING" ]] && SERVICE_URL="${SERVICE_URL}?${SERVICE_QUERYSTRING}"
   plugn trigger service-action post-link "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
   if [[ "$DOKKU_GLOBAL_FLAGS" == *"--no-restart"* ]] || [[ "$SERVICE_RESTART_APPS" == "false" ]]; then
@@ -989,14 +982,6 @@ service_unlink() {
 
   plugn trigger service-action pre-unlink "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
   remove_from_links_file "$SERVICE" "$APP"
-
-  if declare -f -F add_passed_docker_option >/dev/null; then
-    # shellcheck disable=SC2034
-    local passed_phases=(build deploy run)
-    remove_passed_docker_option passed_phases[@] "--link $SERVICE_NAME:$SERVICE_DNS_HOSTNAME"
-  else
-    dokku docker-options:remove "$APP" build,deploy,run "--link $SERVICE_NAME:$SERVICE_DNS_HOSTNAME"
-  fi
 
   [[ -z ${LINK[*]} ]] && dokku_log_fail "Not linked to app $APP"
   plugn trigger service-action post-unlink "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
