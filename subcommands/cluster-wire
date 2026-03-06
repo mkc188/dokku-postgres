@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/config"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/common-functions"
+
+cluster_wire() {
+  local SERVICE="$1"
+  verify_service_name "$SERVICE"
+  local SERVICE_NAME="$(get_service_name "$SERVICE")"
+  # Get running container ID
+  local CONTAINER_ID
+  CONTAINER_ID=$("$DOCKER_BIN" ps -q -f "name=^/$SERVICE_NAME$") || true
+  if [ -z "$CONTAINER_ID" ]; then
+    dokku_log_fail "Service $SERVICE is not running"
+  fi
+
+  # Verify wire script exists inside the container
+  if ! "$DOCKER_BIN" container exec "$SERVICE_NAME" test -x /docker-entrypoint-initdb.d/wire; then
+    dokku_log_fail "Wire script not found. Ensure NODE_NAME was set during service creation and cluster-scripts are mounted."
+  fi
+
+  # Execute the wiring script inside the container
+  "$DOCKER_BIN" container exec -i "$SERVICE_NAME" /docker-entrypoint-initdb.d/wire
+}
+
+cluster-wire-cmd() {
+  #E wire the pgedge cluster nodes together
+  #A service, service to wire (must have CLUSTER_NODES configured)
+  declare desc="wire the postgres cluster"
+  local cmd="$PLUGIN_COMMAND_PREFIX:cluster-wire" argv=("$@")
+  [[ ${argv[0]} == "$cmd" ]] && shift 1
+  local SERVICE="$1"
+  cluster_wire "$SERVICE"
+}
+
+cluster-wire-cmd "$@"

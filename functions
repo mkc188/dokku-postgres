@@ -5,6 +5,8 @@ set -eo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common-functions"
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+# Determine absolute plugin directory
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$PLUGIN_AVAILABLE_PATH/config/functions"
 if [[ -f "$PLUGIN_AVAILABLE_PATH/docker-options/functions" ]]; then
   source "$PLUGIN_AVAILABLE_PATH/docker-options/functions"
@@ -80,6 +82,10 @@ service_create_container() {
   fi
 
   DOCKER_ARGS=()
+  # Mount cluster init scripts if NODE_NAME is set in the service config
+  if [ -f "$SERVICE_ROOT/ENV" ] && grep -q '^NODE_NAME=' "$SERVICE_ROOT/ENV" ]; then
+    DOCKER_ARGS+=("--volume=$PLUGIN_DIR/cluster-scripts:/docker-entrypoint-initdb.d:ro")
+  fi
   DOCKER_ARGS+=("--cidfile=$SERVICE_ROOT/ID")
   DOCKER_ARGS+=("--env-file=$SERVICE_ROOT/ENV")
   DOCKER_ARGS+=("--env=POSTGRES_PASSWORD=$PASSWORD")

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -Eeo pipefail
+: "${CLUSTER_NODES:?CLUSTER_NODES list is required, e.g. CLUSTER_NODES='n1:host1:5432,n2:host2:5432'}"
+: "${POSTGRES_DB:?POSTGRES_DB required}"
+: "${POSTGRES_USER:?POSTGRES_USER required}"
+: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}"
+: "${PGEDGE_USER:?PGEDGE_USER required}"
+: "${PGEDGE_PASSWORD:?PGEDGE_PASSWORD required}"
+IFS=',' read -r -a NODE_ENTRIES <<< "$CLUSTER_NODES"
+NAMES=(); HOSTS=(); PORTS=()
+for entry in "${NODE_ENTRIES[@]}"; do
+  name="${entry%%:*}"
+  rest="${entry#*:}"
+  host="${rest%%:*}"
+  port="${rest##*:}"
+  NAMES+=("$name"); HOSTS+=("$host"); PORTS+=("$port")
+done
+psql_ok () {
+  local host="$1" port="$2" user="$3" pass="$4" sql="$5"
+  PGPASSWORD="$pass" psql -h "$host" -p "$port" -U "$user" -d "$POSTGRES_DB" -t -A -v ON_ERROR_STOP=1 -c "$sql" >/dev/null 2>&1
+}
+echo "[wire] Waiting for all nodes (admin access)..."
+for i in "${!NAMES[@]}"; do
+  h="${HOSTS[$i]}"; p="${PORTS[$i]}"
+  until psql_ok "$h" "$p" "$POSTGRES_USER" "$POSTGRES_PASSWORD" "select 1"; do
+    echo "[wire] waiting for $h:$p ..."
+    sleep 1
+  done
+done
+echo "[wire] Waiting until each DB reports its own spock.node row..."
+for i in "${!NAMES[@]}"; do
+  n="${NAMES[$i]}"; h="${HOSTS[$i]}"; p="${PORTS[$i]}"
+  until PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$h" -p "$p" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A \
+    -c "SELECT 1 FROM spock.node WHERE node_name='$n' LIMIT 1;" | grep -q '^1$'; do
+    echo "[wire] waiting for spock.node '$n' on $h:$p ..."
+    sleep 1
+  done
+done
+echo "[wire] Creating full-mesh subscriptions (idempotent; providers use '$PGEDGE_USER')..."
+for i in "${!NAMES[@]}"; do
+  ai="${NAMES[$i]}"; ah="${HOSTS[$i]}"; ap="${PORTS[$i]}"
+  # Sanitize node names for subscription: only lowercase, numbers, underscores
+  ai_sanitized=$(echo "$ai" | tr -c 'a-zA-Z0-9_' '_')
+  for j in "${!NAMES[@]}"; do
+    [ "$i" -eq "$j" ] && continue
+    bj="${NAMES[$j]}"; bh="${HOSTS[$j]}"; bp="${PORTS[$j]}"
+    bj_sanitized=$(echo "$bj" | tr -c 'a-zA-Z0-9_' '_')
+    sub="sub_${ai_sanitized}_${bj_sanitized}"
+    echo "[wire] ensuring $sub exists on $ai -> $bj ..."
+    PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$ah" -p "$ap" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+      -c "SELECT spock.sub_create(subscription_name := '$sub', provider_dsn := 'host=$bh port=$bp dbname=$POSTGRES_DB user=$PGEDGE_USER password=$PGEDGE_PASSWORD') WHERE NOT EXISTS (SELECT 1 FROM spock.subscription WHERE sub_name='$sub');" \
+      >/dev/null
+  done
+done
+echo "[wire] Wiring complete."
