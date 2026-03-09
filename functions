@@ -121,7 +121,7 @@ service_create_container() {
   fi
 
   dokku_log_verbose_quiet "Creating container database"
-  "$DOCKER_BIN" container exec "$SERVICE_NAME" su - postgres -c "createdb -E utf8 --template=template0 $DATABASE_NAME" || dokku_log_verbose_quiet 'Database may already exist'
+  "$DOCKER_BIN" container exec -u postgres "$SERVICE_NAME" createdb -E utf8 --template=template0 "$DATABASE_NAME" || dokku_log_verbose_quiet 'Database may already exist'
   # For cluster nodes (NODE_NAME set), skip SSL pause/start to avoid double-start issues
   if ! grep -q '^NODE_NAME=' "$SERVICE_ROOT/ENV" 2>/dev/null; then
     dokku_log_verbose_quiet "Securing connection to database"
