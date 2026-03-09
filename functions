@@ -122,12 +122,15 @@ service_create_container() {
 
   dokku_log_verbose_quiet "Creating container database"
   "$DOCKER_BIN" container exec "$SERVICE_NAME" su - postgres -c "createdb -E utf8 $DATABASE_NAME" 2>/dev/null || dokku_log_verbose_quiet 'Already exists'
-  dokku_log_verbose_quiet "Securing connection to database"
-  service_pause "$SERVICE" >/dev/null
-  "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/create_ssl_certs.sh" "$SERVICE_ROOT" &>/dev/null
-  "$DOCKER_BIN" container run --rm -i -v "$SERVICE_HOST_ROOT/data:$DATA_DIR" -v "$SERVICE_HOST_ROOT/certs:/var/lib/postgresql/certs" "$PLUGIN_IMAGE:$PLUGIN_IMAGE_VERSION" bash -s <"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/enable_ssl.sh" &>/dev/null
-  rm -rf "$SERVICE_HOST_ROOT/certs"
-  suppress_output "$DOCKER_BIN" container start "$(cat "$SERVICE_ROOT/ID")"
+  # For cluster nodes (NODE_NAME set), skip SSL pause/start to avoid double-start issues
+  if ! grep -q '^NODE_NAME=' "$SERVICE_ROOT/ENV" 2>/dev/null; then
+    dokku_log_verbose_quiet "Securing connection to database"
+    service_pause "$SERVICE" >/dev/null
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/create_ssl_certs.sh" "$SERVICE_ROOT" &>/dev/null
+    "$DOCKER_BIN" container run --rm -i -v "$SERVICE_HOST_ROOT/data:$DATA_DIR" -v "$SERVICE_HOST_ROOT/certs:/var/lib/postgresql/certs" "$PLUGIN_IMAGE:$PLUGIN_IMAGE_VERSION" bash -s <"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/enable_ssl.sh" &>/dev/null
+    rm -rf "$SERVICE_HOST_ROOT/certs"
+    suppress_output "$DOCKER_BIN" container start "$(cat "$SERVICE_ROOT/ID")"
+  fi
   service_port_reconcile_status "$SERVICE"
   dokku_log_info2 "$PLUGIN_SERVICE container created: $SERVICE"
   service_info "$SERVICE"
