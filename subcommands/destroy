@@ -52,7 +52,7 @@ service-destroy-cmd() {
 
   dokku_log_verbose_quiet "Removing data"
   "$DOCKER_BIN" container run --rm -v "$SERVICE_HOST_ROOT/data:/data" -v "$SERVICE_HOST_ROOT/$PLUGIN_CONFIG_SUFFIX:/config" "$PLUGIN_BUSYBOX_IMAGE" chmod 777 -R /config /data
-  rm -rf "$SERVICE_ROOT"
+  rm -rf "$SERVICE_ROOT" "$SERVICE_HOST_ROOT"
 
   fn-plugin-property-destroy "$PLUGIN_COMMAND_PREFIX" "$SERVICE"
 
