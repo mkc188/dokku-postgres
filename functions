@@ -121,7 +121,12 @@ service_create_container() {
   fi
 
   dokku_log_verbose_quiet "Creating container database"
-  "$DOCKER_BIN" container exec -u postgres "$SERVICE_NAME" createdb -E utf8 --template=template0 "$DATABASE_NAME" || dokku_log_verbose_quiet 'Database may already exist'
+  local PG_USER="postgres"
+  if [[ -f "$SERVICE_ROOT/ENV" ]] && grep -q '^POSTGRES_USER=' "$SERVICE_ROOT/ENV"; then
+    PG_USER="$(grep '^POSTGRES_USER=' "$SERVICE_ROOT/ENV" | cut -d= -f2- | tr -d '\r\n')"
+  fi
+  local PG_PASSWORD="$(service_password "$SERVICE")"
+  "$DOCKER_BIN" container exec -u postgres -e PGPASSWORD="$PG_PASSWORD" "$SERVICE_NAME" createdb -U "$PG_USER" -E utf8 --template=template0 "$DATABASE_NAME" || dokku_log_verbose_quiet 'Database may already exist'
   # For cluster nodes (NODE_NAME set), skip SSL pause/start to avoid double-start issues
   if ! grep -q '^NODE_NAME=' "$SERVICE_ROOT/ENV" 2>/dev/null; then
     dokku_log_verbose_quiet "Securing connection to database"
@@ -285,4 +290,111 @@ service_cluster_add() {
   dokku_log_info2 "Successfully added $REMOTE_HOST to postgres cluster"
   dokku_log_info2_quiet "Cluster node: $REMOTE_HOST"
   dokku_log_info2_quiet "Wireguard IP: $REMOTE_WIREGUARD_IP"
+}
+
+service_cluster_unwire() {
+  declare desc="clean up cluster-specific resources when destroying a cluster node"
+  local SERVICE="$1"
+  local SERVICE_ROOT="$PLUGIN_DATA_ROOT/$SERVICE"
+  local ENV_FILE="$SERVICE_ROOT/ENV"
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    return 0
+  fi
+
+  # Check if this is a cluster node (NODE_NAME set)
+  if ! grep -q '^NODE_NAME=' "$ENV_FILE"; then
+    return 0
+  fi
+
+  dokku_log_verbose_quiet "Cleaning up cluster resources for $SERVICE"
+
+  # Extract cluster-related environment variables
+  local CLUSTER_NODES NODE_NAME
+  CLUSTER_NODES=$(grep '^CLUSTER_NODES=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+  NODE_NAME=$(grep '^NODE_NAME=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+
+  # Remove local wireguard container if it exists
+  if "$DOCKER_BIN" container inspect "dokku.wireguard" >/dev/null 2>&1; then
+    dokku_log_verbose_quiet "Removing wireguard container"
+    suppress_output "$DOCKER_BIN" container stop "dokku.wireguard" >/dev/null 2>&1 || true
+    suppress_output "$DOCKER_BIN" container rm "dokku.wireguard" >/dev/null 2>&1 || true
+  fi
+
+  # Remove wireguard network if it exists and has no attached containers
+  if "$DOCKER_BIN" network inspect "dokku-postgres-wg" >/dev/null 2>&1; then
+    local CONTAINER_COUNT
+    CONTAINER_COUNT=$("$DOCKER_BIN" network inspect "dokku-postgres-wg" --format '{{len .Containers}}' 2>/dev/null || echo 0)
+    if [[ "$CONTAINER_COUNT" -eq 0 ]]; then
+      dokku_log_verbose_quiet "Removing wireguard network"
+      suppress_output "$DOCKER_BIN" network rm "dokku-postgres-wg" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # If CLUSTER_NODES is set, attempt best-effort peer cleanup (non-fatal)
+  if [[ -n "$CLUSTER_NODES" ]] && [[ -n "$NODE_NAME" ]]; then
+    # We'll need admin credentials. Try to get them from ENV.
+    local POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB EXTERNAL_HOST EXTERNAL_PORT PGEDGE_USER
+    POSTGRES_USER=$(grep '^POSTGRES_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+    POSTGRES_PASSWORD=$(grep '^POSTGRES_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+    POSTGRES_DB=$(grep '^POSTGRES_DB=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+    EXTERNAL_HOST=$(grep '^EXTERNAL_HOST=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+    EXTERNAL_PORT=$(grep '^EXTERNAL_PORT=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+    PGEDGE_USER=$(grep '^PGEDGE_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+
+    # We need POSTGRES_USER and POSTGRES_PASSWORD to manage subscriptions on peers
+    if [[ -z "$POSTGRES_USER" ]] || [[ -z "$POSTGRES_PASSWORD" ]]; then
+      dokku_log_verbose_quiet "Cluster peers: cannot clean up (missing admin credentials)"
+      return 0
+    fi
+
+    IFS=',' read -r -a NODE_ENTRIES <<< "$CLUSTER_NODES"
+    for entry in "${NODE_ENTRIES[@]}"; do
+      local name rest host port
+      name="${entry%%:*}"
+      rest="${entry#*:}"
+      host="${rest%%:*}"
+      port="${rest##*:}"
+      # Skip this node itself
+      if [[ "$name" == "$NODE_NAME" ]]; then
+        continue
+      fi
+      dokku_log_verbose_quiet "Notifying peer $name ($host:$port) of node departure"
+      # We'll attempt to drop subscriptions that have this node as provider.
+      # Use a temporary container with psql to connect to the peer
+      # The admin user is POSTGRES_USER, database is POSTGRES_DB
+      # We will drop the local spock node entry for this node on the peer, which will cascade delete subscriptions? Not automatically. We need to drop subscriptions first.
+      # Strategy: Find the node_id of this node in spock.node on the peer, then drop any subscriptions with sub_provider = that node_id.
+      # We'll execute a series of commands via psql. We'll use the POSTGRES_IMAGE to run a temporary container if needed, but installation likely has client tools on host? Use the plugin's image.
+      local CMD
+      CMD="
+        DO \$\$
+        DECLARE
+          node_id int;
+          sub record;
+        BEGIN
+          SELECT node_id INTO node_id FROM spock.node WHERE node_name = '$NODE_NAME';
+          IF node_id IS NOT NULL THEN
+            FOR sub IN SELECT sub_name FROM spock.subscription WHERE sub_provider = node_id LOOP
+              BEGIN
+                PERFORM spock.sub_drop(sub.sub_name);
+                RAISE NOTICE 'Dropped subscription %', sub.sub_name;
+              EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'Failed to drop subscription %: %', sub.sub_name, SQLERRM;
+              END;
+            END LOOP;
+            DELETE FROM spock.node WHERE node_id = node_id;
+            RAISE NOTICE 'Removed node entry for $NODE_NAME';
+          END IF;
+        END
+        \$\$;"
+      # Run the command using the postgres image
+      if ! suppress_output "$DOCKER_BIN" container run --rm \
+        -e PGPASSWORD="$POSTGRES_PASSWORD" \
+        "$PLUGIN_IMAGE:$PLUGIN_IMAGE_VERSION" \
+        psql -h "$host" -p "$port" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$CMD" 2>/dev/null; then
+        dokku_log_verbose_quiet "Peer cleanup for $name failed (non-fatal)"
+      fi
+    done
+  fi
 }

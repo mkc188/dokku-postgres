@@ -45,6 +45,11 @@ service-destroy-cmd() {
   service_backup_unschedule "$SERVICE"
   service_container_rm "$SERVICE"
 
+  # Clean up cluster resources before removing data
+  if type service_cluster_unwire >/dev/null 2>&1; then
+    service_cluster_unwire "$SERVICE"
+  fi
+
   dokku_log_verbose_quiet "Removing data"
   "$DOCKER_BIN" container run --rm -v "$SERVICE_HOST_ROOT/data:/data" -v "$SERVICE_HOST_ROOT/$PLUGIN_CONFIG_SUFFIX:/config" "$PLUGIN_BUSYBOX_IMAGE" chmod 777 -R /config /data
   rm -rf "$SERVICE_ROOT"
