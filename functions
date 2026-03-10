@@ -126,7 +126,12 @@ service_create_container() {
     PG_USER="$(grep '^POSTGRES_USER=' "$SERVICE_ROOT/ENV" | cut -d= -f2- | tr -d '\r\n')"
   fi
   local PG_PASSWORD="$(service_password "$SERVICE")"
-  "$DOCKER_BIN" container exec -u postgres -e PGPASSWORD="$PG_PASSWORD" "$SERVICE_NAME" createdb -U "$PG_USER" -E utf8 --template=template0 "$DATABASE_NAME" || dokku_log_verbose_quiet 'Database may already exist'
+  # Check if database already exists (e.g., created by entrypoint via POSTGRES_DB)
+  if ! "$DOCKER_BIN" container exec -u postgres -e PGPASSWORD="$PG_PASSWORD" "$SERVICE_NAME" psql -U "$PG_USER" -lqt 2>/dev/null | grep -w "$DATABASE_NAME" > /dev/null; then
+    "$DOCKER_BIN" container exec -u postgres -e PGPASSWORD="$PG_PASSWORD" "$SERVICE_NAME" createdb -U "$PG_USER" -E utf8 --template=template0 "$DATABASE_NAME" || dokku_log_verbose_quiet "Database creation failed"
+  else
+    dokku_log_verbose_quiet "Database $DATABASE_NAME already exists, skipping creation"
+  fi
   # For cluster nodes (NODE_NAME set), skip SSL pause/start to avoid double-start issues
   if ! grep -q '^NODE_NAME=' "$SERVICE_ROOT/ENV" 2>/dev/null; then
     dokku_log_verbose_quiet "Securing connection to database"
@@ -310,9 +315,15 @@ service_cluster_unwire() {
   dokku_log_verbose_quiet "Cleaning up cluster resources for $SERVICE"
 
   # Extract cluster-related environment variables
-  local CLUSTER_NODES NODE_NAME
+  local CLUSTER_NODES NODE_NAME POSTGRES_USER POSTGRES_DB
   CLUSTER_NODES=$(grep '^CLUSTER_NODES=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
   NODE_NAME=$(grep '^NODE_NAME=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+  POSTGRES_USER=$(grep '^POSTGRES_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+  POSTGRES_DB=$(grep '^POSTGRES_DB=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
+
+  # Get admin password from service password file (more reliable than ENV)
+  local ADMIN_PASSWORD
+  ADMIN_PASSWORD="$(service_password "$SERVICE" 2>/dev/null || true)"
 
   # Remove local wireguard container if it exists
   if "$DOCKER_BIN" container inspect "dokku.wireguard" >/dev/null 2>&1; then
@@ -333,18 +344,16 @@ service_cluster_unwire() {
 
   # If CLUSTER_NODES is set, attempt best-effort peer cleanup (non-fatal)
   if [[ -n "$CLUSTER_NODES" ]] && [[ -n "$NODE_NAME" ]]; then
-    # We'll need admin credentials. Try to get them from ENV.
-    local POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB EXTERNAL_HOST EXTERNAL_PORT PGEDGE_USER
-    POSTGRES_USER=$(grep '^POSTGRES_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
-    POSTGRES_PASSWORD=$(grep '^POSTGRES_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
-    POSTGRES_DB=$(grep '^POSTGRES_DB=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
-    EXTERNAL_HOST=$(grep '^EXTERNAL_HOST=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
-    EXTERNAL_PORT=$(grep '^EXTERNAL_PORT=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
-    PGEDGE_USER=$(grep '^PGEDGE_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n' || true)
-
-    # We need POSTGRES_USER and POSTGRES_PASSWORD to manage subscriptions on peers
-    if [[ -z "$POSTGRES_USER" ]] || [[ -z "$POSTGRES_PASSWORD" ]]; then
-      dokku_log_verbose_quiet "Cluster peers: cannot clean up (missing admin credentials)"
+    # We need admin credentials to manage subscriptions on peers
+    # Use POSTGRES_USER (default to postgres) and ADMIN_PASSWORD from service
+    if [[ -z "$POSTGRES_USER" ]]; then
+      POSTGRES_USER="postgres"
+    fi
+    if [[ -z "$POSTGRES_DB" ]]; then
+      POSTGRES_DB="$(get_database_name "$SERVICE")"
+    fi
+    if [[ -z "$ADMIN_PASSWORD" ]]; then
+      dokku_log_verbose_quiet "Cluster peers: cannot clean up (missing admin password)"
       return 0
     fi
 
@@ -360,22 +369,16 @@ service_cluster_unwire() {
         continue
       fi
       dokku_log_verbose_quiet "Notifying peer $name ($host:$port) of node departure"
-      # We'll attempt to drop subscriptions that have this node as provider.
-      # Use a temporary container with psql to connect to the peer
-      # The admin user is POSTGRES_USER, database is POSTGRES_DB
-      # We will drop the local spock node entry for this node on the peer, which will cascade delete subscriptions? Not automatically. We need to drop subscriptions first.
-      # Strategy: Find the node_id of this node in spock.node on the peer, then drop any subscriptions with sub_provider = that node_id.
-      # We'll execute a series of commands via psql. We'll use the POSTGRES_IMAGE to run a temporary container if needed, but installation likely has client tools on host? Use the plugin's image.
       local CMD
       CMD="
         DO \$\$
         DECLARE
-          node_id int;
+          v_node_id int;
           sub record;
         BEGIN
-          SELECT node_id INTO node_id FROM spock.node WHERE node_name = '$NODE_NAME';
-          IF node_id IS NOT NULL THEN
-            FOR sub IN SELECT sub_name FROM spock.subscription WHERE sub_provider = node_id LOOP
+          SELECT node_id INTO v_node_id FROM spock.node WHERE node_name = '$NODE_NAME';
+          IF v_node_id IS NOT NULL THEN
+            FOR sub IN SELECT sub_name FROM spock.subscription WHERE sub_provider = v_node_id LOOP
               BEGIN
                 PERFORM spock.sub_drop(sub.sub_name);
                 RAISE NOTICE 'Dropped subscription %', sub.sub_name;
@@ -383,14 +386,13 @@ service_cluster_unwire() {
                 RAISE WARNING 'Failed to drop subscription %: %', sub.sub_name, SQLERRM;
               END;
             END LOOP;
-            DELETE FROM spock.node WHERE node_id = node_id;
+            DELETE FROM spock.node WHERE node_id = v_node_id;
             RAISE NOTICE 'Removed node entry for $NODE_NAME';
           END IF;
         END
         \$\$;"
-      # Run the command using the postgres image
       if ! suppress_output "$DOCKER_BIN" container run --rm \
-        -e PGPASSWORD="$POSTGRES_PASSWORD" \
+        -e PGPASSWORD="$ADMIN_PASSWORD" \
         "$PLUGIN_IMAGE:$PLUGIN_IMAGE_VERSION" \
         psql -h "$host" -p "$port" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$CMD" 2>/dev/null; then
         dokku_log_verbose_quiet "Peer cleanup for $name failed (non-fatal)"
