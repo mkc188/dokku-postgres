@@ -369,26 +369,24 @@ service_cluster_unwire() {
         continue
       fi
       dokku_log_verbose_quiet "Notifying peer $name ($host:$port) of node departure"
+      # Compute subscription name: sub_<subscriber>_<provider>
+      # The wire script uses: sub_${ai_sanitized}_${bj_sanitized} where ai is subscriber (the node we connect to) and bj is provider
+      local peer_sanitized node_sanitized sub_name
+      peer_sanitized=$(echo "$name" | tr -c 'a-zA-Z0-9_' '_')
+      node_sanitized=$(echo "$NODE_NAME" | tr -c 'a-zA-Z0-9_' '_')
+      sub_name="sub_${peer_sanitized}_${node_sanitized}"
       local CMD
       CMD="
         DO \$\$
-        DECLARE
-          v_node_id int;
-          sub record;
         BEGIN
-          SELECT node_id INTO v_node_id FROM spock.node WHERE node_name = '$NODE_NAME';
-          IF v_node_id IS NOT NULL THEN
-            FOR sub IN SELECT sub_name FROM spock.subscription WHERE sub_provider = v_node_id LOOP
-              BEGIN
-                PERFORM spock.sub_drop(sub.sub_name);
-                RAISE NOTICE 'Dropped subscription %', sub.sub_name;
-              EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'Failed to drop subscription %: %', sub.sub_name, SQLERRM;
-              END;
-            END LOOP;
-            DELETE FROM spock.node WHERE node_id = v_node_id;
-            RAISE NOTICE 'Removed node entry for $NODE_NAME';
-          END IF;
+          -- Drop subscription from peer to this node (if exists)
+          BEGIN
+            PERFORM spock.sub_drop('$sub_name');
+          EXCEPTION WHEN OTHERS THEN
+            -- Ignore if subscription does not exist
+          END;
+          -- Remove node entry for this node from peer's spock.node table
+          DELETE FROM spock.node WHERE node_name = '$NODE_NAME';
         END
         \$\$;"
       if ! suppress_output "$DOCKER_BIN" container run --rm \
